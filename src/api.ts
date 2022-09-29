@@ -1,5 +1,4 @@
 import rest, { RestOptions } from "@halliday/rest";
-// import { NewUser, User } from "./user";
 
 export const config = {
     baseUrl: "/",

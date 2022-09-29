@@ -1,7 +1,6 @@
 import { Fetcher } from "@halliday/rest";
 import * as api from "./api";
-import { stripSearchParams } from "./tools";
-// import { NewUser, Userinfo } from "./user";
+import { stripHashParams, stripParams, stripSearchParams } from "./tools";
 
 export const nearlyExpiredThreshold = 30 * 1000; // 1 minute
 export const defaultKey = "session";
@@ -10,6 +9,8 @@ export type Userinfo = api.Userinfo;
 export type User = api.User;
 export type UserUpdate = api.UserUpdate;
 export type NewUser = api.NewUser;
+
+const accessTokenSubjectPrefix = "user|";
 
 export class Session {
     private pendingRefresh: Promise<void> | null = null;
@@ -34,6 +35,12 @@ export class Session {
 
     get nearlyExpired() {
         return new Date().getTime() + nearlyExpiredThreshold > this.expiresAt.getTime();
+    }
+
+    // Session subject = User ID
+    get sub() {
+        const token = parseToken(this.accessToken) as AccessTokenClaims;
+        return token.sub.slice(accessTokenSubjectPrefix.length);
     }
 
     async refresh(scope?: string): Promise<void> {
@@ -75,20 +82,20 @@ export class Session {
     }
 
     async updateSelf(u: UserUpdate) {
-        await api.updateUsersSelf(u, {fetcher: this.fetch});
-        if (this.userinfo) {
-            this.userinfo = {...this.userinfo, ...u};
-            this.idToken = createToken(this.userinfo);
-            this.store();
-        }
+        await api.updateUsersSelf(u, { fetcher: this.fetch });
+        this.userinfo = { ...this.userinfo, ...u };
+        this.idToken = createToken(this.userinfo);
+        this.store();
     }
 
     deleteSelf() {
-        return api.deleteUsersSelf({fetcher: this.fetch});
+        return api.deleteUsersSelf({ fetcher: this.fetch });
     }
 
-    fetchUserinfo() {
-        return api.userinfo({fetcher: this.fetch});
+    async fetchUserinfo() {
+        const userinfo = await api.userinfo({ fetcher: this.fetch });
+        this.idToken = createToken(userinfo);
+        this.store();
     }
 
     logout() {
@@ -101,7 +108,7 @@ export class Session {
     }
 
     instructEmailChange(email: string, redirectUri = document.location.href): Promise<void> {
-        return api.instructEmailChange(email, redirectUri, {fetcher: this.fetch});
+        return api.instructEmailChange(email, redirectUri, { fetcher: this.fetch });
     }
 }
 
@@ -109,110 +116,117 @@ export function deleteSession(key = defaultKey) {
     localStorage.removeItem(key);
 }
 
-let passwordResetEmail = "";
-let resetPasswordToken: string | null = null;
-
-type ChangeEmailTokenClaims = {
-    sub: string,
-    email: string
-}
 
 type AccessTokenClaims = {
     sub: string,
     scope: string
 }
 
-export async function loadSession(key = defaultKey): Promise<[sess: Session | null, reason: string]> {
-    let sess: Session | null = null;
-    let reason = "none";
+type ChangeEmailTokenClaims = {
+    aud: "_change_email"
+    sub: string,
+    email: string
+}
 
-    // 1 - check for a session in local storage
+type PasswordResetTokenClaims = {
+    aud: "_reset_password"
+    sub: string,
+    email: string
+}
+
+type RegistrationTokenClaims = {
+    aud: "_complete_registration"
+    sub: string,
+    email: string
+}
+
+//
+
+let emailHint: string | null = null;
+let token: string | null = null;
+
+export type OAuth2ErrorStatus = "invalid_request" | "unauthorized_client" | "access_denied" | "unsupported_response_type" | "invalid_scope" | "server_error" | "temporarily_unavailable";
+
+export type Status =
+    "no-session" |
+    "login" |
+    "refreshed" | "revoked" | "loaded" |
+    "email-confirmed" | "email-confirmation-failed" | "login-for-email-confirmation-required" |
+    "password-reset-required" |
+    "registration-completed" | "registration-failed" | "login-for-registration-required" |
+    "social-login-exchanged" | "social-login-failed" |
+    "unknown-token" |
+    "invalid-subject" |
+    `oauth2-${OAuth2ErrorStatus}`
+
+export async function reviveSession(key = defaultKey): Promise<[sess: Session | null, status: Status]> {
 
     const storage = localStorage.getItem(key);
-    if (storage) {
-        const params = new URLSearchParams(storage);
-        const accessToken = params.get("access_token")!;
-        const refreshToken = params.get("refresh_token")!;
-        const scope = params.get("scope")!;
-        const scopes = scope === "" ? [] : scope.split(" ");
-        const expiresAt = new Date(parseInt(params.get("expires_at")!) * 1000);
-        const issuedAt = new Date(parseInt(params.get("issued_at")!) * 1000);
-        const idToken = params.get("id_token")!;
-        sess = new Session(key, accessToken, refreshToken, scopes, issuedAt, expiresAt, idToken);
+    if (!storage) return [null, "no-session"];
 
-        if (sess.nearlyExpired) {
-            try {
-                await sess.refresh();
-                reason = "refresh";
-            } catch (err) {
-                console.warn("The session could not be refreshed. The token loaded from local storage might be expired or was revoked.");
-                reason = "session-revoked";
-                deleteSession(key);
-            }
-            if (sess) {
-                sess.store();
-            }
+    const params = new URLSearchParams(storage);
+    const accessToken = params.get("access_token")!;
+    const refreshToken = params.get("refresh_token")!;
+    const scope = params.get("scope")!;
+    const scopes = scope === "" ? [] : scope.split(" ");
+    const expiresAt = new Date(parseInt(params.get("expires_at")!) * 1000);
+    const issuedAt = new Date(parseInt(params.get("issued_at")!) * 1000);
+    const idToken = params.get("id_token")!;
+    const sess = new Session(key, accessToken, refreshToken, scopes, issuedAt, expiresAt, idToken);
+
+    if (sess.nearlyExpired) {
+        try {
+            await sess.refresh();
+            return [sess, "refreshed"];
+        } catch (err) {
+            console.warn("The session could not be refreshed. The token loaded from local storage might be expired or was revoked.");
+            localStorage.removeItem(key);
+            return [null, "revoked"];
         }
     }
+    try {
+        await sess.fetchUserinfo();
+    } catch (err) {
+        localStorage.removeItem(key);
+        return [null, "revoked"];
+    }
 
-    // 2 - check for a registration_token in the URL (that was sent by email) and complete the registration by API call
+    return [sess, "loaded"];
+}
 
-    const search = new URLSearchParams(window.location.search);
+export async function loadSession(key = defaultKey): Promise<[sess: Session | null, status: Status]> {
+    // 1 - check for a session in local storage
+    let [sess, status] = await reviveSession(key); 
+
+    // 2 - check for a token in the URL that might require some action
     const hash = new URLSearchParams(location.hash.slice(1));
-
-    const registrationToken = search.get("registration_token");
-    if (registrationToken) {
-        stripSearchParams("registration_token");
-        try {
-            await api.completeRegistration(registrationToken);
-            reason = "registration-completed";
-        } catch (err) {
-            console.warn("The registration could not be completed. The token loaded from the URL is invalid or has expired.");
-            reason = "registration-failed";
-        }
-    }
-
-    // 3 - check for a password_reset_token in the URL (that was sent by email)
-
-    resetPasswordToken = search.get("password_reset_token");
-    if (resetPasswordToken) {
-        const claims = JSON.parse(atob(resetPasswordToken.split(".")[1])) as Record<string, any>;
-        passwordResetEmail = claims.email as string;
-        stripSearchParams("password_reset_token");
-        console.info("Password reset token loaded from URL. The user will be prompted to enter a new password.");
-        reason = "password-reset";
-    }
-
-    // 4 - check for a change_email_token in the URL (that was sent by email)
-
-    const changeEmailToken = search.get("change_email_token");
-    if (changeEmailToken) {
-        const redirectUri = search.get("redirect_uri") ?? undefined;
-        stripSearchParams("change_email_token", "redirect_uri");
-        try {
-            await api.changeEmail(changeEmailToken, redirectUri);
-            reason = "email-confirmed";
-        } catch (err) {
-            console.warn("The registration could not be completed. The token loaded from the URL is invalid or has expired.");
-            reason = "email-confirmation-failed";
-        }
-        if (sess && sess.userinfo) {
-            const {sub, email} = parseToken(changeEmailToken) as ChangeEmailTokenClaims;
-            if (sub === sess.userinfo.sub) {
-                sess.userinfo.email = email;
-                sess.idToken = createToken(sess.userinfo);
-                sess.store();
-            } else {
-                try {
-                    await sess.logout();
-                } catch (err) {
-                    console.warn("The session could not be logged out.");
-                }
+    token = hash.get("token");
+    if (token) {
+        stripHashParams("token");
+        status = await consumeToken(sess, token);
+        if (status === "invalid-subject") {
+            try {
+                await sess!.logout();
+            } catch (err) {
+                // log error but discard anyways
+                console.warn("The old session could not be logged out:", err);
             }
+            sess = null;
+            status = await consumeToken(null, token);
+        }
+        switch (status) {
+            case "email-confirmed":
+            case "email-confirmation-failed":
+            case "registration-completed":
+            case "registration-failed":
+            case "unknown-token":
+                token = null;
         }
     }
 
-    // 5 - check for an code or access_token in the URL, as returned by an OAuth2 authorization server (e.g. a social login provider)
+
+    // 3 - check for an code or access_token in the URL, as returned by an OAuth2 authorization server (e.g. a social login provider)
+    const search = new URLSearchParams(window.location.search);
 
     // response_type=code
     // see https://www.rfc-editor.org/rfc/rfc6749#section-4.1.2
@@ -228,16 +242,16 @@ export async function loadSession(key = defaultKey): Promise<[sess: Session | nu
     const state = search.get("state") ?? hash.get("state") ?? undefined;
 
     if (code || access_token || id_token) {
-        stripSearchParams("code", "access_token", "token_type", "expires_in", "scope", "id_token", "state");
+        stripParams("code", "access_token", "token_type", "expires_in", "scope", "id_token", "state");
         location.hash = "";
 
         let resp: api.TokenResponse | undefined;
         try {
-            resp = await api.exchangeSocialLogin({code, access_token, token_type, expires_in, scope, id_token, state} as api.AuthResponse);
-            reason = "social-login-exchanged";
-        } catch(err) {
+            resp = await api.exchangeSocialLogin({ code, access_token, token_type, expires_in, scope, id_token, state } as api.AuthResponse);
+            status = "social-login-exchanged";
+        } catch (err) {
             console.warn("The social login could not be completed. The token loaded from the URL is invalid or has expired.");
-            reason = "social-login-failed";
+            status = "social-login-failed";
         }
         if (resp) {
             sess = sessionFromTokenResponse(key, resp);
@@ -247,19 +261,96 @@ export async function loadSession(key = defaultKey): Promise<[sess: Session | nu
 
     const error = search.get("error") ?? hash.get("error") ?? undefined;
     if (error) {
-        stripSearchParams("error");
-        location.hash = "";
-        reason = error;
+        const errorDescription = search.get("error_description") ?? hash.get("error_description") ?? undefined;
+        const errorUri = search.get("error_uri") ?? hash.get("error_uri") ?? undefined;
+        stripParams("error", "error_description", "error_uri", "state");
+        console.warn("OAuth2 error:", error, errorDescription, errorUri);
+        status = `oauth2-${error as OAuth2ErrorStatus}`;
     }
 
-    return [sess, reason];
+    return [sess, status];
 }
 
-export async function login(username:string, password: string, sessKey: string) {
+async function consumeToken(sess: Session | null, token: string): Promise<Status> {
+    const redirectUri = new URLSearchParams(location.hash.slice(1)).get("redirect_uri") || undefined;
+    const claims = parseToken(token!) as ChangeEmailTokenClaims | PasswordResetTokenClaims | RegistrationTokenClaims;
+    if (sess && sess.sub !== claims.sub) {
+        return "invalid-subject";
+    }
+
+    switch (claims.aud) {
+        case "_change_email":
+            if (sess) {
+                const email = claims.email;
+                try {
+                    await api.changeEmail(token!, redirectUri);
+
+                    sess.userinfo = { ...sess.userinfo, email, email_verified: true };
+                    sess.idToken = createToken(sess.userinfo);
+                    sess.store();
+
+                    // token = null;
+                    return "email-confirmed";
+                } catch (err) {
+                    console.warn("The email change could not be completed. The token loaded from the URL is invalid or has expired.");
+                    // token = null;
+                    return "email-confirmation-failed";
+                }
+            } else {
+                emailHint = claims.email;
+                return "login-for-email-confirmation-required";
+            }
+
+        case "_reset_password":
+
+            emailHint = claims.email;
+            return "password-reset-required";
+
+        case "_complete_registration":
+
+        if (sess) {
+                try {
+                    await api.completeRegistration(token!, redirectUri);
+
+                    sess.userinfo = { ...sess.userinfo, email_verified: true };
+                    sess.idToken = createToken(sess.userinfo);
+                    sess.store();
+
+                    return "registration-completed";
+                } catch (err) {
+                    console.warn("The registration could not be completed. The token loaded from the URL is invalid or has expired.");
+                    return "registration-failed";
+                }
+                // token = null;
+            } else {
+                emailHint = claims.email;
+                return "login-for-registration-required";
+            }
+        default:
+            console.warn("The token loaded from the URL has an unknown audience and can not be processed.");
+            // token = null;
+            return "unknown-token";
+    }
+}
+
+export async function login(username: string, password: string, sessKey: string): Promise<[Session, Status]> {
     const resp = await api.login(username, password);
     const sess = sessionFromTokenResponse(sessKey, resp);
     sess.store();
-    return sess;
+
+    if (token) {
+       const status = await consumeToken(sess, token);
+       switch (status) {
+           case "email-confirmed":
+           case "email-confirmation-failed":
+           case "registration-completed":
+           case "registration-failed":
+           case "unknown-token":
+               token = null;
+       }
+    }
+
+    return [sess, "login"];
 }
 
 function sessionFromTokenResponse(key: string, resp: api.TokenResponse): Session {
@@ -275,17 +366,20 @@ function sessionFromTokenResponse(key: string, resp: api.TokenResponse): Session
     );
 }
 
-export function requiresPasswordReset(): boolean {
-    return resetPasswordToken != null;
-}
+// export function requiresPasswordReset(): boolean {
+//     return resetPasswordToken != null;
+// }
 
-export function getPasswordResetEmail(): string {
-    return passwordResetEmail;
+export function getEmailHint(): string | null {
+    return emailHint;
 }
 
 export async function resetPassword(newPassword: string): Promise<void> {
-    await api.resetPassword(resetPasswordToken!, newPassword);
-    resetPasswordToken = null;
+    if (!token) throw new Error("No token loaded from the URL.");
+    const claims = parseToken(token) as PasswordResetTokenClaims;
+    if (claims.aud !== "_reset_password") throw new Error("The token loaded from the URL is not a password reset token.");
+    await api.resetPassword(token, newPassword);
+    token = null;
 }
 
 export function register(user: api.NewUser, password: string, redirectUri = document.location.href): Promise<void> {
@@ -310,6 +404,6 @@ function createToken(u: Userinfo): string {
         alg: "none",
         typ: "JWT",
     };
-    return btoa(JSON.stringify(jwtHeaderAlgNone))+"."+btoa(JSON.stringify(u))+".";
+    return btoa(JSON.stringify(jwtHeaderAlgNone)) + "." + btoa(JSON.stringify(u)) + ".";
 
 }

@@ -1,2 +1,2 @@
 export * as api from "./api";
-export { defaultKey, deleteSession, getPasswordResetEmail, instructPasswordReset, loadSession, login, nearlyExpiredThreshold, register, requiresPasswordReset, resetPassword, Session, socialLoginUri, User, Userinfo, UserUpdate, NewUser } from "./session";
+export { defaultKey, deleteSession, getEmailHint, instructPasswordReset, loadSession, reviveSession, login, nearlyExpiredThreshold, register, resetPassword, Session, socialLoginUri, User, Userinfo, UserUpdate, NewUser, Status } from "./session";
