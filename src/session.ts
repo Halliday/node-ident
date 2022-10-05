@@ -47,11 +47,15 @@ export class Session {
         if (this.pendingRefresh)
             return this.pendingRefresh;
         this.pendingRefresh = (async (): Promise<void> => {
-            const resp = await api.token({
+            const req: api.TokenRequest = {
                 grant_type: "refresh_token",
                 refresh_token: this.refreshToken,
-                scope: scope,
-            });
+            };
+            if (scope !== undefined)
+                req.scope = scope;
+            
+            const resp = await api.token(req);
+
             this.accessToken = resp.access_token;
             this.refreshToken = resp.refresh_token ?? this.refreshToken;
             this.scopes = resp.scope === undefined ? this.scopes : (resp.scope === "" ? [] : resp.scope.split(" "));
@@ -61,6 +65,9 @@ export class Session {
             this.userinfo = parseToken(this.idToken);
             this.store();
         })();
+        this.pendingRefresh.finally(() => {
+            this.pendingRefresh = null
+        });
         return this.pendingRefresh;
     }
 
@@ -289,11 +296,9 @@ async function consumeToken(sess: Session | null, token: string): Promise<Status
                     sess.idToken = createToken(sess.userinfo);
                     sess.store();
 
-                    // token = null;
                     return "email-confirmed";
                 } catch (err) {
                     console.warn("The email change could not be completed. The token loaded from the URL is invalid or has expired.");
-                    // token = null;
                     return "email-confirmation-failed";
                 }
             } else {
@@ -311,6 +316,7 @@ async function consumeToken(sess: Session | null, token: string): Promise<Status
         if (sess) {
                 try {
                     await api.completeRegistration(token!, redirectUri);
+                    await sess.refresh();
 
                     sess.userinfo = { ...sess.userinfo, email_verified: true };
                     sess.idToken = createToken(sess.userinfo);
@@ -321,14 +327,12 @@ async function consumeToken(sess: Session | null, token: string): Promise<Status
                     console.warn("The registration could not be completed. The token loaded from the URL is invalid or has expired.");
                     return "registration-failed";
                 }
-                // token = null;
             } else {
                 emailHint = claims.email;
                 return "login-for-registration-required";
             }
         default:
             console.warn("The token loaded from the URL has an unknown audience and can not be processed.");
-            // token = null;
             return "unknown-token";
     }
 }
