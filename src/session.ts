@@ -290,7 +290,7 @@ async function consumeToken(sess: Session | null, token: string): Promise<Status
             if (sess) {
                 const email = claims.email;
                 try {
-                    await api.changeEmail(token!, redirectUri);
+                    await api.changeEmail(token!, redirectUri, {fetcher: sess.fetch});
 
                     sess.userinfo = { ...sess.userinfo, email, email_verified: true };
                     sess.idToken = createToken(sess.userinfo);
@@ -315,7 +315,7 @@ async function consumeToken(sess: Session | null, token: string): Promise<Status
 
         if (sess) {
                 try {
-                    await api.completeRegistration(token!, redirectUri);
+                    await api.completeRegistration(token!, redirectUri, {fetcher: sess.fetch});
                     await sess.refresh();
 
                     sess.userinfo = { ...sess.userinfo, email_verified: true };
