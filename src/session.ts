@@ -13,20 +13,25 @@ export type NewUser = api.NewUser;
 const accessTokenSubjectPrefix = "user|";
 
 export class Session {
-    private pendingRefresh: Promise<void> | null = null;
-    public userinfo: Userinfo;
+    public userinfo: Userinfo | undefined;
 
     constructor(
         readonly key: string,
         public accessToken: string,
-        public refreshToken: string,
+        public refreshToken: string | undefined,
         public scopes: string[],
         public issuedAt: Date,
         public expiresAt: Date,
-        public idToken: string,
+        idToken: string | undefined,
     ) {
         this.fetch = this.fetch.bind(this);
-        this.userinfo = parseToken(idToken);
+        if (idToken) {
+            try {
+                this.userinfo = parseToken(idToken);
+            } catch(err) {
+                console.error("Error parsing ID token", err);
+            }
+        }
     }
 
     get expired() {
@@ -43,42 +48,41 @@ export class Session {
         return token.sub.slice(accessTokenSubjectPrefix.length);
     }
 
-    async refresh(scope?: string): Promise<void> {
-        if (this.pendingRefresh)
-            return this.pendingRefresh;
-        this.pendingRefresh = (async (): Promise<void> => {
-            const req: api.TokenRequest = {
-                grant_type: "refresh_token",
-                refresh_token: this.refreshToken,
-            };
-            if (scope !== undefined)
-                req.scope = scope;
-            
-            const resp = await api.token(req);
+    refresh = sequential(async (scope?: string): Promise<void> => {
+        if(!this.refreshToken) throw new Error("No refresh token");
 
-            this.accessToken = resp.access_token;
-            this.refreshToken = resp.refresh_token ?? this.refreshToken;
-            this.scopes = resp.scope === undefined ? this.scopes : (resp.scope === "" ? [] : resp.scope.split(" "));
-            this.issuedAt = new Date();
-            this.expiresAt = new Date(this.issuedAt.getTime() + resp.expires_in * 1000);
-            this.idToken = resp.id_token || this.idToken;
-            this.userinfo = parseToken(this.idToken);
-            this.store();
-        })();
-        this.pendingRefresh.finally(() => {
-            this.pendingRefresh = null
-        });
-        return this.pendingRefresh;
-    }
+        const req: api.TokenRequest = {
+            grant_type: "refresh_token",
+            refresh_token: this.refreshToken,
+        };
+        if (scope !== undefined)
+            req.scope = scope;
+        
+        const resp = await api.token(req);
+
+        this.accessToken = resp.access_token;
+        this.refreshToken = resp.refresh_token ?? this.refreshToken;
+        this.scopes = resp.scope === undefined ? this.scopes : (resp.scope === "" ? [] : resp.scope.split(" "));
+        this.issuedAt = new Date();
+        this.expiresAt = new Date(this.issuedAt.getTime() + resp.expires_in * 1000);
+        if (resp.id_token) {
+            try {
+                this.userinfo = parseToken(resp.id_token);
+            } catch(err) {
+                console.error("Error parsing ID token", err);
+            }
+        }
+        this.store();
+    });
 
     store() {
         const p = new URLSearchParams();
         p.set("access_token", this.accessToken);
-        p.set("refresh_token", this.refreshToken);
+        if(this.refreshToken) p.set("refresh_token", this.refreshToken);
         p.set("issued_at", Math.floor(this.issuedAt.getTime() / 1000).toString());
         p.set("expires_at", Math.floor(this.expiresAt.getTime() / 1000).toString());
         p.set("scope", this.scopes.join(" "));
-        p.set("id_token", this.idToken);
+        if (this.userinfo) p.set("id_token", createToken(this.userinfo));
         localStorage.setItem(this.key, p.toString());
     }
 
@@ -90,9 +94,10 @@ export class Session {
 
     async updateSelf(u: UserUpdate) {
         await api.updateUsersSelf(u, { fetcher: this.fetch });
-        this.userinfo = { ...this.userinfo, ...u };
-        this.idToken = createToken(this.userinfo);
-        this.store();
+        if (this.userinfo) {
+            this.userinfo = { ...this.userinfo, ...u };
+            this.store();
+        }
     }
 
     deleteSelf() {
@@ -100,14 +105,16 @@ export class Session {
     }
 
     async fetchUserinfo() {
-        const userinfo = await api.userinfo({ fetcher: this.fetch });
-        this.idToken = createToken(userinfo);
+        this.userinfo = await api.userinfo({ fetcher: this.fetch });
         this.store();
     }
 
-    logout() {
+    async logout() {
         this.delete();
-        return api.logout(this.refreshToken);
+        if (this.refreshToken) {
+            await api.logout(this.refreshToken);
+        }
+        return 
     }
 
     delete() {
@@ -116,6 +123,25 @@ export class Session {
 
     instructEmailChange(email: string, redirectUri = document.location.href): Promise<void> {
         return api.instructEmailChange(email, redirectUri, { fetcher: this.fetch });
+    }
+
+    //
+    
+    private listeners = new Set<(session: Session) => void>();
+
+    on(ev: "change", listener: (session: Session) => void) {
+        this.listeners.add(listener);
+        return () => this.off("change", listener);
+    }
+
+    private emit(ev: "change") {
+        for (const listener of this.listeners) {
+            listener(this);
+        }
+    }
+
+    off(ev: "change", listener: (session: Session) => void) {
+        this.listeners.delete(listener);
     }
 }
 
@@ -181,7 +207,7 @@ export async function reviveSession(key = defaultKey): Promise<[sess: Session | 
     const idToken = params.get("id_token")!;
     const sess = new Session(key, accessToken, refreshToken, scopes, issuedAt, expiresAt, idToken);
 
-    if (sess.nearlyExpired) {
+    if (sess.nearlyExpired && sess.refreshToken) {
         try {
             await sess.refresh();
             return [sess, "refreshed"];
@@ -291,11 +317,10 @@ async function consumeToken(sess: Session | null, token: string): Promise<Status
                 const email = claims.email;
                 try {
                     await api.changeEmail(token!, redirectUri, {fetcher: sess.fetch});
-
-                    sess.userinfo = { ...sess.userinfo, email, email_verified: true };
-                    sess.idToken = createToken(sess.userinfo);
-                    sess.store();
-
+                    if (sess.userinfo) {
+                        sess.userinfo = { ...sess.userinfo, email, email_verified: true };
+                        sess.store();
+                    }
                     return "email-confirmed";
                 } catch (err) {
                     console.warn("The email change could not be completed. The token loaded from the URL is invalid or has expired.");
@@ -316,11 +341,11 @@ async function consumeToken(sess: Session | null, token: string): Promise<Status
         if (sess) {
                 try {
                     await api.completeRegistration(token!, redirectUri, {fetcher: sess.fetch});
+                    if (sess.userinfo) {
+                        sess.userinfo = { ...sess.userinfo, email_verified: true };
+                        sess.store();
+                    }
                     await sess.refresh();
-
-                    sess.userinfo = { ...sess.userinfo, email_verified: true };
-                    sess.idToken = createToken(sess.userinfo);
-                    sess.store();
 
                     return "registration-completed";
                 } catch (err) {
@@ -410,4 +435,14 @@ function createToken(u: Userinfo): string {
     };
     return btoa(JSON.stringify(jwtHeaderAlgNone)) + "." + btoa(JSON.stringify(u)) + ".";
 
+}
+
+function sequential<Fn extends () => Promise<any>>(fn: Fn): Fn {
+    let pending: Promise<any> | null = null;
+    return ((...args) => {
+        if (pending) return pending;
+        pending = fn(...args);
+        pending.then(() => pending = null);
+        return pending;
+    }) as Fn;
 }
