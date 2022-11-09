@@ -3,7 +3,7 @@ import * as api from "./api";
 import { stripHashParams, stripParams, stripSearchParams } from "./tools";
 
 export const nearlyExpiredThreshold = 30 * 1000; // 1 minute
-export const defaultKey = "session";
+// export const defaultKey = "session";
 
 export type Userinfo = api.Userinfo;
 export type User = api.User;
@@ -12,23 +12,39 @@ export type NewUser = api.NewUser;
 
 const accessTokenSubjectPrefix = "user|";
 
-export type OAuth2ErrorStatus = "invalid_request" | "unauthorized_client" | "access_denied" | "unsupported_response_type" | "invalid_scope" | "server_error" | "temporarily_unavailable";
+// export type SessionStatus =
+//     "no-session" |
+//     "login" | "logout" |
+//     "userinfo" |
+//     "refreshed" | "revoked" | "loaded" |
+//     "email-confirmed" | "email-confirmation-failed" | "login-for-email-confirmation-required" |
+//     "password-reset-required" |
+//     "registration-completed" | "registration-failed" | "login-for-registration-required" |
+//     "social-login-exchanged" | "social-login-failed" |
+//     "unknown-token" |
+//     "invalid-subject" |
+//     `oauth2-${OAuth2ErrorStatus}`;
 
-export type Status =
-    "no-session" |
-    "login" | "logout" |
-    "userinfo" |
-    "refreshed" | "revoked" | "loaded" |
-    "email-confirmed" | "email-confirmation-failed" | "login-for-email-confirmation-required" |
-    "password-reset-required" |
-    "registration-completed" | "registration-failed" | "login-for-registration-required" |
-    "social-login-exchanged" | "social-login-failed" |
-    "unknown-token" |
-    "invalid-subject" |
-    `oauth2-${OAuth2ErrorStatus}`;
+export type ChangeEmailTokenClaims = {
+    aud: "_change_email"
+    sub: string,
+    email: string
+}
+
+export type PasswordResetTokenClaims = {
+    aud: "_reset_password"
+    sub: string,
+    email: string
+}
+
+export type RegistrationTokenClaims = {
+    aud: "_complete_registration"
+    sub: string,
+    email: string
+}
 
 export class Session {
-    public userinfo: Userinfo | null = null;
+    public user: User | null = null;
 
     constructor(
         public accessToken: string,
@@ -41,7 +57,7 @@ export class Session {
         this.fetch = this.fetch.bind(this);
         if (idToken) {
             try {
-                this.userinfo = parseToken(idToken);
+                this.user = parseToken(idToken);
             } catch (err) {
                 console.error("Error parsing ID token", err);
             }
@@ -57,7 +73,7 @@ export class Session {
     }
 
     // Session subject = User ID
-    get sub() {
+    get sub(): string | null{
         const token = parseToken(this.accessToken) as AccessTokenClaims;
         return token.sub.slice(accessTokenSubjectPrefix.length);
     }
@@ -81,12 +97,12 @@ export class Session {
         this.expiresAt = new Date(this.issuedAt.getTime() + resp.expires_in * 1000);
         if (resp.id_token) {
             try {
-                this.userinfo = parseToken(resp.id_token);
+                this.user = parseToken(resp.id_token);
             } catch (err) {
                 console.error("Error parsing ID token", err);
             }
         }
-        this.store();
+        // this.store();
         this.emit("refresh");
         if (resp.id_token) {
             this.emit("userinfo");
@@ -103,25 +119,30 @@ export class Session {
         return fetcher(req);
     }
 
-    async updateSelf(u: UserUpdate) {
+    async updateUser(u: UserUpdate) {
         await api.updateUsersSelf(u, { fetcher: this.fetch });
-        if (this.userinfo) {
-            this.userinfo = { ...this.userinfo, ...u };
+        if (this.user) {
+            this.user = { ...this.user, ...u };
             this.emit("userinfo");
         }
     }
 
-    deleteSelf() {
-        return api.deleteUsersSelf({ fetcher: this.fetch });
+    async updatePassword(oldPassword: string, newPassword: string): Promise<void> {
+        await this.updateUser({ new_password: newPassword, old_password: oldPassword });
+    }
+
+    async deleteUser() {
+        await api.deleteUsersSelf({ fetcher: this.fetch });
+        this.emit("delete-user");
     }
 
     async fetchUserinfo() {
-        this.userinfo = await api.userinfo({ fetcher: this.fetch });
+        this.user = await api.userinfo({ fetcher: this.fetch });
         this.emit("userinfo");
     }
 
     async logout() {
-        this.delete();
+        // localStorage.removeItem(key);
         if (this.refreshToken) {
             try {
                 await api.logout(this.refreshToken);
@@ -139,6 +160,26 @@ export class Session {
 
     instructEmailChange(email: string, redirectUri = document.location.href): Promise<void> {
         return api.instructEmailChange(email, redirectUri, { fetcher: this.fetch });
+    }
+
+    async completeRegistration(token: string, redirectUri?: string) {
+        await api.completeRegistration(token, redirectUri, { fetcher: this.fetch });
+        if (this.user) {
+            this.user = { ...this.user, email_verified: true };
+            this.emit("userinfo");
+        }
+        await this.refresh();
+    }
+
+    async changeEmail(token: string, redirectUri?: string) {
+        const claims = parseToken(token) as ChangeEmailTokenClaims;
+        if (claims.sub !== this.sub) throw new Error("Invalid subject");
+        const email = claims.email;
+        await api.changeEmail(token, redirectUri, { fetcher: this.fetch });
+        if (this.user) {
+            this.user = { ...this.user, email, email_verified: true };
+            this.emit("userinfo");
+        }
     }
 
     //
@@ -201,14 +242,14 @@ export class Session {
         p.set("issued_at", Math.floor(this.issuedAt.getTime() / 1000).toString());
         p.set("expires_at", Math.floor(this.expiresAt.getTime() / 1000).toString());
         p.set("scope", this.scopes.join(" "));
-        if (this.userinfo) p.set("id_token", createToken(this.userinfo));
+        if (this.user) p.set("id_token", createToken(this.user));
         return p;
     }
 }
 
 export type SessionEventListener = (ev: SessionEvent) => void;
 
-export type SessionEventType = "refresh" | "userinfo";
+export type SessionEventType = "refresh" | "userinfo" | "delete-user";
 
 export class SessionEvent {
     constructor(
@@ -218,9 +259,9 @@ export class SessionEvent {
     ) { }
 }
 
-export function deleteSession(key = defaultKey) {
-    localStorage.removeItem(key);
-}
+// export function deleteSession(key = defaultKey) {
+//     localStorage.removeItem(key);
+// }
 
 
 type AccessTokenClaims = {
@@ -435,17 +476,17 @@ type AccessTokenClaims = {
 //     token = null;
 // }
 
-export function register(user: api.NewUser, password: string, redirectUri = document.location.href): Promise<void> {
-    return api.register(user, password, redirectUri);
-}
+// export function register(user: api.NewUser, password: string, redirectUri = document.location.href): Promise<void> {
+//     return api.register(user, password, redirectUri);
+// }
 
-export function instructPasswordReset(email: string, redirectUri = document.location.href): Promise<void> {
-    return api.instructPasswordReset(email, redirectUri);
-}
+// export function instructPasswordReset(email: string, redirectUri = document.location.href): Promise<void> {
+//     return api.instructPasswordReset(email, redirectUri);
+// }
 
-export function socialLoginUri(iss: string, redirectUri = document.location.href) {
-    return api.socialLoginUri(iss, redirectUri);
-}
+// export function socialLoginUri(iss: string, redirectUri = document.location.href) {
+//     return api.socialLoginUri(iss, redirectUri);
+// }
 
 function parseToken(token: string): any {
     const parts = token.split(".");

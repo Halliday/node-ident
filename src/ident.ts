@@ -1,59 +1,67 @@
 import { Fetcher } from "@halliday/rest";
-import { OAuth2ErrorStatus, Session, SessionEvent, SessionEventType, Status as SessionStatus } from "./session";
+import { ChangeEmailTokenClaims, PasswordResetTokenClaims, RegistrationTokenClaims, Session, SessionEvent, SessionEventType, User, Userinfo } from "./session";
 import * as api from "./api";
 
-export type IdentityStatus =
-    "no-session" |
+export type OAuth2ErrorStatus = "invalid_request" | "unauthorized_client" | "access_denied" | "unsupported_response_type" | "invalid_scope" | "server_error" | "temporarily_unavailable";
+
+export type IdentityEventType =
     "login" | "logout" |
     "userinfo" |
     "refreshed" | "revoked" | "loaded" |
     "email-confirmed" | "email-confirmation-failed" | "login-for-email-confirmation-required" |
     "password-reset-required" |
-    "registration-completed" | "registration-failed" | "login-for-registration-required" |
-    "social-login-exchanged" | "social-login-failed" |
+    "registered" | "registration-completed" | "registration-failed" | "login-for-registration-required" |
+    "social-login" | "social-login-failed" |
     "unknown-token" |
     "invalid-subject" |
     `oauth2-${OAuth2ErrorStatus}` |
     `session-${SessionEventType}`;
 
 export class IdentityEvent {
-    constructor(public type: string, public name: string) { }
+    constructor(
+        readonly ident: IdentityManager,
+        readonly type: IdentityEventType,
+        readonly err?: any) { }
+}
+
+export class IdentityError {
+    constructor(
+        readonly ident: IdentityManager,
+        readonly type: IdentityEventType,
+        readonly cause?: any) { }
 }
 
 export type IdentityListener = (event: IdentityEvent) => void;
 
 export const defaultKey = "session";
 
-type AccessTokenClaims = {
-    sub: string,
-    scope: string
-}
+// type AccessTokenClaims = {
+//     sub: string,
+//     scope: string
+// }
 
-type ChangeEmailTokenClaims = {
-    aud: "_change_email"
-    sub: string,
-    email: string
-}
-
-type PasswordResetTokenClaims = {
-    aud: "_reset_password"
-    sub: string,
-    email: string
-}
-
-type RegistrationTokenClaims = {
-    aud: "_complete_registration"
-    sub: string,
-    email: string
-}
+const sessionEvents: SessionEventType[] = [
+    "refresh", "userinfo", "delete-user",
+];
 
 class IdentityManager {
+    session: Session | null;
 
-    key = defaultKey;
-    session: Session | null = null;
+    constructor(readonly key = defaultKey) {
+        this.session = this.loadLastSessionFromStorage();
+        if (this.session) {
+            for(const ev of sessionEvents)
+                this.session.addEventListener(ev, this.handleSessionEvent);
+        }
+    }
 
-    status: IdentityStatus = "no-session";
-    err: any = null;
+    get sub(): string | null {
+        return this.session?.sub ?? null;
+    }
+
+    get user(): User | null {
+        return this.session?.user ?? null;
+    }
 
     //
 
@@ -63,69 +71,74 @@ class IdentityManager {
         }
     }
 
-    private handleSessionEvent(ev: SessionEvent) {
-
+    private handleSessionEvent = (ev: SessionEvent) => {
+        this.store();
+        this.emit(`session-${ev.type}`, ev.err);
+        if (ev.type === "delete-user") {
+            localStorage.removeItem(this.key);
+            this.setSession(null);
+        }
     }
 
     private setSession(session: Session | null) {
-        if(this.session) {
-            this.session.removeEventListener("refresh", this.handleSessionEvent);
-            this.session.removeEventListener("userinfo", this.handleSessionEvent);
+        if (this.session) {
+            for(const ev of sessionEvents)
+                this.session.removeEventListener(ev, this.handleSessionEvent);
         }
         this.session = session;
-        if(this.session) {
-            this.session.addEventListener("refresh", this.handleSessionEvent);
-            this.session.addEventListener("userinfo", this.handleSessionEvent);
+        if (this.session) {
+            for(const ev of sessionEvents)
+                this.session.addEventListener(ev, this.handleSessionEvent);
         }
     }
 
     //
 
-    async reviveSession(): Promise<Session | null> {
+    private loadLastSessionFromStorage(): Session | null {
         const storage = localStorage.getItem(this.key);
-        if (!storage) {
-            this.setSession(null);
-            this.status = "no-session";
-            return null;
-        }
+        if (!storage) return null;
 
         const params = new URLSearchParams(storage);
-        const accessToken = params.get("access_token")!;
-        const refreshToken = params.get("refresh_token")!;
+        const accessToken = params.get("access_token");
+        if (!accessToken) {
+            console.log("There is a session in storage, but it has no access token.");
+            localStorage.removeItem(this.key);
+            throw null;
+        }
+        const refreshToken = params.get("refresh_token");
         const scope = params.get("scope")!;
         const scopes = scope === "" ? [] : scope.split(" ");
         const expiresAt = new Date(parseInt(params.get("expires_at")!) * 1000);
         const issuedAt = new Date(parseInt(params.get("issued_at")!) * 1000);
         const idToken = params.get("id_token")!;
-        const sess = new Session(accessToken, refreshToken, scopes, issuedAt, expiresAt, idToken);
-
-        if (sess.nearlyExpired && sess.refreshToken) {
-            try {
-                await sess.refresh();
-                this.session = sess;
-                return sess;
-            } catch (err) {
-                console.warn("The session could not be refreshed. The token loaded from local storage might be expired or was revoked.");
-                localStorage.removeItem(this.key);
-                this.status = "revoked";
-                this.err = err;
-                this.session = null;
-                return null;
-            }
-        }
-        try {
-            await sess.fetchUserinfo();
-        } catch (err) {
-            localStorage.removeItem(this.key);
-            this.status = "revoked";
-            this.err = err;
-            this.session = null;
-            return null;
-        }
-
-        this.session = sess;
-        return sess;
+        return new Session(accessToken, refreshToken, scopes, issuedAt, expiresAt, idToken);
     }
+
+    // private async resumeLastSession(): Promise<Session | null> {
+    //     const sess = await this.loadLastSessionFromStorage();
+    //     if (!sess) return null;
+
+    //     if (sess.nearlyExpired && sess.refreshToken) {
+    //         try {
+    //             await sess.refresh();
+    //         } catch (err) {
+    //             console.error(err);
+    //             console.warn("The stored session could not be refreshed. The token loaded from local storage might be expired or was revoked.");
+    //             localStorage.removeItem(this.key);
+    //             throw new Error("session revoked");
+    //         }
+    //     }
+    //     try {
+    //         await sess.fetchUserinfo();
+    //     } catch (err) {
+    //         console.error(err);
+    //         console.warn("Fetching userinfo for the stored session failed. The token loaded from local storage might be expired or was revoked.");
+    //         localStorage.removeItem(this.key);
+    //         throw new Error("session revoked");
+    //     }
+
+    //     return sess;
+    // }
 
     fetch = async (req: Request, fetcher: Fetcher = globalThis.fetch) => {
         if (!this.session) return fetcher(req);
@@ -135,34 +148,56 @@ class IdentityManager {
     public emailHint: string | null = null;
     private token: string | null = null;
 
-    async loadSession(): Promise<Session | null> {
-        // 1 - check for a session in local storage
-        this.session = await this.reviveSession();
-        if (this.session) return this.session;
+    async logout() {
+        if (!this.session) return;
+        localStorage.removeItem(this.key);
+        try {
+            await this.session!.logout();
+        } catch (err) {
+            // log error but discard anyways
+            console.warn("The session could not be logged out:", err);
+        }
+        this.setSession(null);
+        this.emit("logout");
+    }
 
-        // 2 - check for a token in the URL that might require some action
+    private setupCalled = false;
+
+    // Setup performs initial work for the identity manager.
+    // It loads the last session from local storage and tries to resume it.
+    // This function must be called once.
+    async setup(): Promise<void> {
+        if (this.setupCalled) return;
+        this.setupCalled = true;
+
+        // check for a token in the URL that might require some action
         const hash = new URLSearchParams(location.hash.slice(1));
         this.token = hash.get("token");
+        if (this.token) stripHashParams("token");
+
         if (this.token) {
-            stripHashParams("token");
-            await this.consumeToken();
-            if (this.status === "invalid-subject") {
-                try {
-                    await this.session!.logout();
-                } catch (err) {
-                    // log error but discard anyways
-                    console.warn("The old session could not be logged out:", err);
-                }
-                this.session = null;
+            try {
                 await this.consumeToken();
-            }
-            switch (this.status) {
-                case "email-confirmed":
-                case "email-confirmation-failed":
-                case "registration-completed":
-                case "registration-failed":
-                case "unknown-token":
-                    this.token = null;
+            } catch (err) {
+                if (err instanceof IdentityError) {
+                    if (err.type === "invalid-subject") {
+                        localStorage.removeItem(this.key);
+                        try {
+                            await this.session!.logout();
+                        } catch (err) {
+                            // log error but discard anyways
+                            console.warn("The old session could not be logged out:", err);
+                        }
+                        this.setSession(null);
+                        // try again without a session
+                        await this.consumeToken();
+                        return;
+                    } else {
+                        throw err;
+                    }
+                } else {
+                    throw err;
+                }
             }
         }
 
@@ -189,14 +224,15 @@ class IdentityManager {
             let resp: api.TokenResponse | undefined;
             try {
                 resp = await api.exchangeSocialLogin({ code, access_token, token_type, expires_in, scope, id_token, state } as api.AuthResponse);
-                this.status = "social-login-exchanged";
+                const session = Session.fromTokenResponse(resp);
+                this.setSession(session);
+                this.store();
+                this.emit("social-login");
+                return;
             } catch (err) {
                 console.warn("The social login could not be completed. The token loaded from the URL is invalid or has expired.");
-                this.status = "social-login-failed";
-            }
-            if (resp) {
-                this.session = Session.fromTokenResponse(resp);
-                this.store();
+                this.emit("social-login-failed", err);
+                return;
             }
         }
 
@@ -206,83 +242,69 @@ class IdentityManager {
             const errorUri = search.get("error_uri") ?? hash.get("error_uri") ?? undefined;
             stripParams("error", "error_description", "error_uri", "state");
             console.warn("OAuth2 error:", error, errorDescription, errorUri);
-            this.status = `oauth2-${error as OAuth2ErrorStatus}`;
+            this.emit(`oauth2-${error as OAuth2ErrorStatus}`);
+            return;
         }
-
-        return this.session;
     }
 
     private async consumeToken(): Promise<void> {
-        if(!this.token) return;
+        if (!this.token) throw new Error("no token");
 
         const redirectUri = new URLSearchParams(location.hash.slice(1)).get("redirect_uri") || undefined;
         const claims = parseToken(this.token) as ChangeEmailTokenClaims | PasswordResetTokenClaims | RegistrationTokenClaims;
         if (this.session && this.session.sub !== claims.sub) {
-            this.status = "invalid-subject";
-            return;
+            throw new IdentityError(this, "invalid-subject");
         }
 
         switch (claims.aud) {
             case "_change_email":
                 if (this.session) {
-                    const email = claims.email;
                     try {
-                        await api.changeEmail(this.token, redirectUri, { fetcher: this.fetch });
-                        if (this.session.userinfo) {
-                            this.session.userinfo = { ...this.session.userinfo, email, email_verified: true };
-                            // TODO emit event for userinfo change
-                        }
-                        this.status = "email-confirmed";
+                        await this.session.changeEmail(this.token, redirectUri);
                         this.token = null;
-                        return;
+                        this.emit("email-confirmed");
                     } catch (err) {
                         console.warn("The email change could not be completed. The token loaded from the URL is invalid or has expired.");
-                        this.status = "email-confirmation-failed";
                         this.token = null;
+                        this.emit("email-confirmation-failed", err);
                         return;
                     }
                 } else {
                     this.emailHint = claims.email;
-                    this.status = "login-for-email-confirmation-required";
+                    this.emit("login-for-email-confirmation-required");
                     return
                 }
 
             case "_reset_password":
 
                 this.emailHint = claims.email;
-                this.status = "password-reset-required";
+                this.emit("password-reset-required");
                 return
 
             case "_complete_registration":
 
                 if (this.session) {
                     try {
-                        await api.completeRegistration(this.token, redirectUri, { fetcher: this.fetch });
-                        if (this.session.userinfo) {
-                            this.session.userinfo = { ...this.session.userinfo, email_verified: true };
-                            this.session.store();
-                        }
-                        await this.session.refresh();
-
-                        this.status = "registration-completed";
+                        await this.session.completeRegistration(this.token, redirectUri);
                         this.token = null;
-                        return
+                        this.emit("registration-completed");
+                        return;
                     } catch (err) {
                         console.warn("The registration could not be completed. The token loaded from the URL is invalid or has expired.");
-                        this.status = "registration-failed";
                         this.token = null;
-                        return
+                        this.emit("registration-failed", err);
+                        return;
                     }
                 } else {
                     this.emailHint = claims.email;
-                    this.status = "login-for-registration-required";
-                    return
+                    this.emit("login-for-registration-required");
+                    return;
                 }
             default:
                 console.warn("The token loaded from the URL has an unknown audience and can not be processed.");
-                this.status = "unknown-token";
                 this.token = null;
-                return
+                this.emit("unknown-token");
+                return;
         }
     }
 
@@ -290,14 +312,12 @@ class IdentityManager {
 
     async login(username: string, password: string): Promise<Session> {
         const resp = await api.login(username, password);
-        this.session = Session.fromTokenResponse(this.key, resp);
-        this.session.store();
-    
-        if (this.token) {
-            await this.consumeToken();
-        }
-    
-        return this.session;
+        const session = Session.fromTokenResponse(resp);
+        this.setSession(session);
+        this.store();
+        this.emit("login");
+        if (this.token) await this.consumeToken();
+        return session;
     }
 
     async resetPassword(newPassword: string): Promise<void> {
@@ -307,29 +327,63 @@ class IdentityManager {
         await api.resetPassword(this.token, newPassword);
         this.token = null;
     }
-    
+
 
     //
 
-    private listeners: { [key: string]: Set<IdentityListener> } = {};
+    private listeners: { [type: string]: Set<IdentityListener> } = {};
 
-    addEventListener(ev: string, l: IdentityListener) {
-        if (!this.listeners[ev]) {
-            this.listeners[ev] = new Set();
-        }
-        this.listeners[ev].add(l);
+    addEventListener(type: IdentityEventType, l: IdentityListener): void {
+        if (!this.listeners[type]) this.listeners[type] = new Set();
+        this.listeners[type].add(l);
     }
 
-    removeEventListener(ev: string, l: IdentityListener) {
-        if (!this.listeners[ev]) {
-            return;
+    removeEventListener(type: IdentityEventType, l: IdentityListener): void {
+        if (!this.listeners[type]) return;
+        this.listeners[type].delete(l);
+    }
+
+    private emit(type: IdentityEventType, err?: any): void {
+        console.log("Emitted", type, err);
+        if (!this.listeners[type]) return;
+        const ev = new IdentityEvent(this, type, err);
+        for (const l of this.listeners[type]) {
+            try {
+                l(ev);
+            } catch (err) {
+                console.error("Error in session event listener", err);
+            }
         }
-        this.listeners[ev].delete(l);
+    }
+
+    //
+
+    async register(user: api.NewUser, password: string, redirectUri = document.location.href): Promise<void> {
+        if(!user.email) throw new Error("email is required");
+        await api.register(user, password, redirectUri);
+        const resp = await api.login(user.email, password);
+        const session = Session.fromTokenResponse(resp);
+        this.setSession(session);
+        this.store();
+        this.emit("registered");
+    }
+
+    instructPasswordReset(email: string, redirectUri = document.location.href): Promise<void> {
+        return api.instructPasswordReset(email, redirectUri);
+    }
+
+    instructEmailChange(email: string, redirectUri = document.location.href): Promise<void> {
+        return api.instructEmailChange(email, redirectUri);
+    }
+
+    socialLoginUri(iss: string, redirectUri = document.location.href) {
+        return api.socialLoginUri(iss, redirectUri);
     }
 }
 
 const ident = new IdentityManager();
 export default ident;
+(globalThis as any)["ident"] = ident;
 
 ////////////////////////////////////////////////////////////////////////////////
 
