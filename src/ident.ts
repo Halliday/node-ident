@@ -5,17 +5,16 @@ import * as api from "./api";
 export type OAuth2ErrorStatus = "invalid_request" | "unauthorized_client" | "access_denied" | "unsupported_response_type" | "invalid_scope" | "server_error" | "temporarily_unavailable";
 
 export type IdentityEventType =
-    "login" | "logout" |
-    "userinfo" |
-    "refreshed" | "revoked" | "loaded" |
-    "email-confirmed" | "email-confirmation-failed" | "login-for-email-confirmation-required" |
+    "session-start" | "session-end" |
+    "login" | "logout" | "revoke" |
+    "email-verify" | "email-verify-error" | "login-for-email-verify-required" |
     "password-reset-required" |
-    "registered" | "registration-completed" | "registration-failed" | "login-for-registration-required" |
-    "social-login" | "social-login-failed" |
+    "register" | "registration-complete" | "registration-error" | "login-for-registration-required" |
+    "social-login" | "social-login-error" |
     "unknown-token" |
     "invalid-subject" |
     `oauth2-${OAuth2ErrorStatus}` |
-    `session-${SessionEventType}`;
+    SessionEventType;
 
 export class IdentityEvent {
     constructor(
@@ -73,7 +72,7 @@ class IdentityManager {
 
     private handleSessionEvent = (ev: SessionEvent) => {
         this.store();
-        this.emit(`session-${ev.type}`, ev.err);
+        this.emit(ev.type, ev.err);
         if (ev.type === "delete-user") {
             localStorage.removeItem(this.key);
             this.setSession(null);
@@ -81,14 +80,18 @@ class IdentityManager {
     }
 
     private setSession(session: Session | null) {
+        if (this.session === session) return;
         if (this.session) {
             for(const ev of sessionEvents)
                 this.session.removeEventListener(ev, this.handleSessionEvent);
+            this.session = null;
+            this.emit("session-end");
         }
         this.session = session;
         if (this.session) {
             for(const ev of sessionEvents)
                 this.session.addEventListener(ev, this.handleSessionEvent);
+            this.emit("session-start");
         }
     }
 
@@ -113,32 +116,6 @@ class IdentityManager {
         const idToken = params.get("id_token")!;
         return new Session(accessToken, refreshToken, scopes, issuedAt, expiresAt, idToken);
     }
-
-    // private async resumeLastSession(): Promise<Session | null> {
-    //     const sess = await this.loadLastSessionFromStorage();
-    //     if (!sess) return null;
-
-    //     if (sess.nearlyExpired && sess.refreshToken) {
-    //         try {
-    //             await sess.refresh();
-    //         } catch (err) {
-    //             console.error(err);
-    //             console.warn("The stored session could not be refreshed. The token loaded from local storage might be expired or was revoked.");
-    //             localStorage.removeItem(this.key);
-    //             throw new Error("session revoked");
-    //         }
-    //     }
-    //     try {
-    //         await sess.fetchUserinfo();
-    //     } catch (err) {
-    //         console.error(err);
-    //         console.warn("Fetching userinfo for the stored session failed. The token loaded from local storage might be expired or was revoked.");
-    //         localStorage.removeItem(this.key);
-    //         throw new Error("session revoked");
-    //     }
-
-    //     return sess;
-    // }
 
     fetch = async (req: Request, fetcher: Fetcher = globalThis.fetch) => {
         if (!this.session) return fetcher(req);
@@ -231,7 +208,7 @@ class IdentityManager {
                 return;
             } catch (err) {
                 console.warn("The social login could not be completed. The token loaded from the URL is invalid or has expired.");
-                this.emit("social-login-failed", err);
+                this.emit("social-login-error", err);
                 return;
             }
         }
@@ -245,6 +222,13 @@ class IdentityManager {
             this.emit(`oauth2-${error as OAuth2ErrorStatus}`);
             return;
         }
+    }
+
+    requiresLogin(): boolean {
+        const token = this.token;
+        if(!token || this.session) return false;
+        const claims = parseToken(token) as ChangeEmailTokenClaims | PasswordResetTokenClaims | RegistrationTokenClaims;
+        return claims.aud === "_change_email" || claims.aud === "_complete_registration";
     }
 
     private async consumeToken(): Promise<void> {
@@ -262,16 +246,16 @@ class IdentityManager {
                     try {
                         await this.session.changeEmail(this.token, redirectUri);
                         this.token = null;
-                        this.emit("email-confirmed");
+                        this.emit("email-verify");
                     } catch (err) {
                         console.warn("The email change could not be completed. The token loaded from the URL is invalid or has expired.");
                         this.token = null;
-                        this.emit("email-confirmation-failed", err);
+                        this.emit("email-verify-error", err);
                         return;
                     }
                 } else {
                     this.emailHint = claims.email;
-                    this.emit("login-for-email-confirmation-required");
+                    this.emit("login-for-email-verify-required");
                     return
                 }
 
@@ -287,12 +271,12 @@ class IdentityManager {
                     try {
                         await this.session.completeRegistration(this.token, redirectUri);
                         this.token = null;
-                        this.emit("registration-completed");
+                        this.emit("registration-complete");
                         return;
                     } catch (err) {
                         console.warn("The registration could not be completed. The token loaded from the URL is invalid or has expired.");
                         this.token = null;
-                        this.emit("registration-failed", err);
+                        this.emit("registration-error", err);
                         return;
                     }
                 } else {
@@ -343,11 +327,11 @@ class IdentityManager {
         this.listeners[type].delete(l);
     }
 
-    private emit(type: IdentityEventType, err?: any): void {
-        console.log("Emitted", type, err);
-        if (!this.listeners[type]) return;
-        const ev = new IdentityEvent(this, type, err);
-        for (const l of this.listeners[type]) {
+    private emit(status: IdentityEventType, err?: any): void {
+        console.log("emit", status, err);
+        if (!this.listeners[status]) return;
+        const ev = new IdentityEvent(this, status, err);
+        for (const l of this.listeners[status]) {
             try {
                 l(ev);
             } catch (err) {
@@ -365,7 +349,7 @@ class IdentityManager {
         const session = Session.fromTokenResponse(resp);
         this.setSession(session);
         this.store();
-        this.emit("registered");
+        this.emit("register");
     }
 
     instructPasswordReset(email: string, redirectUri = document.location.href): Promise<void> {
