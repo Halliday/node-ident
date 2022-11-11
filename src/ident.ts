@@ -5,7 +5,7 @@ import * as api from "./api";
 export type OAuth2ErrorStatus = "invalid_request" | "unauthorized_client" | "access_denied" | "unsupported_response_type" | "invalid_scope" | "server_error" | "temporarily_unavailable";
 
 export type IdentityEventType =
-    "session-start" | "session-end" |
+    "session" |
     "login" | "logout" | "revoke" |
     "email-verify" | "email-verify-error" | "login-for-email-verify-required" |
     "password-reset-required" |
@@ -84,15 +84,13 @@ class IdentityManager {
         if (this.session) {
             for(const ev of sessionEvents)
                 this.session.removeEventListener(ev, this.handleSessionEvent);
-            this.session = null;
-            this.emit("session-end");
         }
         this.session = session;
         if (this.session) {
             for(const ev of sessionEvents)
                 this.session.addEventListener(ev, this.handleSessionEvent);
-            this.emit("session-start");
         }
+        this.emit("session");
     }
 
     //
