@@ -117,6 +117,11 @@ class IdentityManager {
 
     fetch = async (req: Request, fetcher: Fetcher = globalThis.fetch) => {
         if (!this.session) return fetcher(req);
+        if (this.session.expired && !this.session.refreshToken) {
+            console.warn("The session is expired and there is no refresh token - it can not be refreshed.");
+            this.setSession(null);
+            return fetcher(req);
+        }
         return this.session.fetch(req, fetcher);
     }
 

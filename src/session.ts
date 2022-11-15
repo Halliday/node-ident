@@ -114,7 +114,7 @@ export class Session {
     // }
 
     async fetch(req: Request, fetcher: Fetcher = globalThis.fetch) {
-        if (this.nearlyExpired) await this.refresh();
+        if (this.nearlyExpired && this.refreshToken) await this.refresh();
         req.headers.set("Authorization", `Bearer ${this.accessToken}`);
         return fetcher(req);
     }
