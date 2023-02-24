@@ -1,5 +1,5 @@
 import { Fetcher } from "@halliday/rest";
-import { ChangeEmailTokenClaims, PasswordResetTokenClaims, RegistrationTokenClaims, Session, SessionEvent, SessionEventType, User, Userinfo } from "./session";
+import { ChangeEmailTokenClaims, PasswordResetTokenClaims, RegistrationTokenClaims, Session, SessionEvent, SessionEventType, User } from "./session";
 import * as api from "./api";
 
 export type OAuth2ErrorStatus = "invalid_request" | "unauthorized_client" | "access_denied" | "unsupported_response_type" | "invalid_scope" | "server_error" | "temporarily_unavailable";
@@ -250,6 +250,7 @@ class IdentityManager {
                         await this.session.changeEmail(this.token, redirectUri);
                         this.token = null;
                         this.emit("email-verify");
+                        return;
                     } catch (err) {
                         console.warn("The email change could not be completed. The token loaded from the URL is invalid or has expired.");
                         this.token = null;
@@ -347,8 +348,7 @@ class IdentityManager {
 
     async register(user: api.NewUser, password: string, redirectUri = document.location.href): Promise<void> {
         if(!user.email) throw new Error("email is required");
-        await api.register(user, password, redirectUri);
-        const resp = await api.login(user.email, password);
+        const resp = await api.register(user, password, redirectUri);
         const session = Session.fromTokenResponse(resp);
         this.setSession(session);
         this.store();
@@ -357,10 +357,6 @@ class IdentityManager {
 
     instructPasswordReset(email: string, redirectUri = document.location.href): Promise<void> {
         return api.instructPasswordReset(email, redirectUri);
-    }
-
-    instructEmailChange(email: string, redirectUri = document.location.href): Promise<void> {
-        return api.instructEmailChange(email, redirectUri);
     }
 
     socialLoginUri(iss: string, redirectUri = document.location.href) {

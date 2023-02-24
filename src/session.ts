@@ -5,7 +5,6 @@ import { stripHashParams, stripParams, stripSearchParams } from "./tools";
 export const nearlyExpiredThreshold = 30 * 1000; // 1 minute
 // export const defaultKey = "session";
 
-export type Userinfo = api.Userinfo;
 export type User = api.User;
 export type UserUpdate = api.UserUpdate;
 export type NewUser = api.NewUser;
@@ -128,7 +127,7 @@ export class Session {
     }
 
     async updatePassword(oldPassword: string, newPassword: string): Promise<void> {
-        await this.updateUser({ new_password: newPassword, old_password: oldPassword });
+        await this.updateUser({ newPassword: newPassword, oldPassword: oldPassword });
     }
 
     async deleteUser() {
@@ -165,7 +164,7 @@ export class Session {
     async completeRegistration(token: string, redirectUri?: string) {
         await api.completeRegistration(token, redirectUri, { fetcher: this.fetch });
         if (this.user) {
-            this.user = { ...this.user, email_verified: true };
+            this.user = { ...this.user, emailVerified: true };
             this.emit("userinfo");
         }
         await this.refresh();
@@ -177,7 +176,7 @@ export class Session {
         const email = claims.email;
         await api.changeEmail(token, redirectUri, { fetcher: this.fetch });
         if (this.user) {
-            this.user = { ...this.user, email, email_verified: true };
+            this.user = { ...this.user, email, emailVerified: true };
             this.emit("userinfo");
         }
     }
@@ -493,7 +492,7 @@ function parseToken(token: string): any {
     return JSON.parse(atob(parts[1]));
 }
 
-function createToken(u: Userinfo): string {
+function createToken(u: User): string {
     const jwtHeaderAlgNone = {
         alg: "none",
         typ: "JWT",
