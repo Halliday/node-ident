@@ -42,6 +42,10 @@ export type RegistrationTokenClaims = {
     email: string
 }
 
+export type FetchOptions = {
+    fetcher?: Fetcher
+}
+
 export class Session {
     public user: User | null = null;
 
@@ -108,12 +112,8 @@ export class Session {
         }
     });
 
-    // store() {
-    //     localStorage.setItem(this.key, this.toURLSearchParams().toString());
-    // }
-
-    async fetch(req: Request, fetcher: Fetcher = globalThis.fetch) {
-        if (this.nearlyExpired && this.refreshToken) await this.refresh();
+    async fetch(req: Request, opts: FetchOptions = {}): Promise<Response> {
+        const {fetcher = globalThis.fetch} = opts;
         req.headers.set("Authorization", `Bearer ${this.accessToken}`);
         return fetcher(req);
     }

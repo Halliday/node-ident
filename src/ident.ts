@@ -43,6 +43,11 @@ const sessionEvents: SessionEventType[] = [
     "refresh", "userinfo", "delete-user",
 ];
 
+type FetchOptions = {
+    onRefreshFailed?: "fail" | "ignore",
+    fetcher?: Fetcher,
+}
+
 class IdentityManager {
     session: Session | null;
 
@@ -115,14 +120,34 @@ class IdentityManager {
         return new Session(accessToken, refreshToken, scopes, issuedAt, expiresAt, idToken);
     }
 
-    fetch = async (req: Request, fetcher: Fetcher = globalThis.fetch) => {
-        if (!this.session) return fetcher(req);
+    fetch = async (req: Request, opts: FetchOptions = {}) => {
+        const {fetcher: fetch = globalThis.fetch, onRefreshFailed = "ignore"} = opts;
+        if (!this.session) return fetch(req);
+        if (this.session.nearlyExpired && this.session.refreshToken) {
+            try {
+                await this.session.refresh();
+            } catch (err) {
+                console.warn("The session could not be refreshed:", err);
+                this.setSession(null);
+                switch (onRefreshFailed) {
+                    case "fail":
+                        return Promise.reject({error: "session_refresh_failed", desc: "The session could not be refreshed.", code: 401, causedBy: err});
+                    case "ignore":
+                        return fetch(req);
+                }
+            }
+        }
         if (this.session.expired && !this.session.refreshToken) {
             console.warn("The session is expired and there is no refresh token - it can not be refreshed.");
             this.setSession(null);
-            return fetcher(req);
+            switch (onRefreshFailed) {
+                case "fail":
+                    return Promise.reject({error: "session_expired", desc: "The session is expired.", code: 401});
+                case "ignore":
+                    return fetch(req);
+            }
         }
-        return this.session.fetch(req, fetcher);
+        return this.session.fetch(req, opts);
     }
 
     public emailHint: string | null = null;
